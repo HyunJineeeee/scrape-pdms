@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-PDMS 학습기업 스크레이퍼
+PDMS 학습기업 스크레이퍼 (안정 재바인딩)
 - 지역만 고정, 지사/참여유형명은 페이지에서 자동 읽어 전체 순회
-- 콤보박스는 매번 '재조회'하여 detached locator 문제 해결
-- visible/enable 대기 + JS fallback 선택
-- 검색/페이지네이션 후에도 프레임/폼/콤보 재바인딩
+- 초기에 각 select의 id/name/인덱스를 '시그니처'로 저장 → 이후 재바인딩은 id/name 우선
+- 라벨이 잠시 사라져도 동작
+- select_option 실패 시 JS fallback
 """
 
 import time, sys
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 import pandas as pd
 from playwright.sync_api import sync_playwright, Page, Frame, Locator
 
@@ -20,10 +20,11 @@ REGIONS = [
     "부산","광주","전남","제주","세종"
 ]
 
-MAX_PAGES_PER_COMBO = 9999   # 테스트 시 3 등으로 축소
+MAX_PAGES_PER_COMBO = 3   # 테스트 시 3 등으로 축소
 
-# ---------- 공통 유틸 ----------
+# ----------------- 공통 유틸 -----------------
 def find_target_frame(page: Page) -> Page | Frame:
+    # combobox가 보이는 프레임을 찾음
     if page.get_by_role("combobox").count() > 0:
         return page
     for f in page.frames:
@@ -34,22 +35,8 @@ def find_target_frame(page: Page) -> Page | Frame:
             pass
     return page
 
-def get_combobox_by_label(ctx: Page | Frame, label_text: str) -> Locator:
-    cb = ctx.get_by_role("combobox", name=label_text)
-    if cb.count() == 0:
-        label = ctx.locator(f"label:has-text('{label_text}')").first
-        if label.count() == 0:
-            raise RuntimeError(f"[셀렉터] 라벨 '{label_text}'을 찾지 못했습니다.")
-        for_id = label.get_attribute("for")
-        sel = ctx.locator(f"select#{for_id}") if for_id else label.locator("xpath=following-sibling::select[1]")
-        if sel.count() == 0:
-            raise RuntimeError(f"[셀렉터] 라벨 '{label_text}'에 연결된 select를 찾지 못했습니다.")
-        return sel
-    return cb.first
-
 def wait_options_loaded(select_el: Locator, min_count: int = 2, timeout_ms: int = 10000):
     select_el.wait_for(state="attached", timeout=timeout_ms)
-    # 보임/활성 대기
     try: select_el.wait_for(state="visible", timeout=timeout_ms)
     except: pass
     start = time.time()
@@ -72,18 +59,17 @@ def list_options_text(select_el: Locator) -> list[str]:
     return out
 
 def select_by_label_with_fallback(ctx: Page | Frame, select_el: Locator, label_text: str):
-    """기본 select_option 시도 → 실패 시 JS로 label 매칭 선택"""
     try:
         select_el.select_option(label=label_text)
         return
     except Exception:
-        # JS fallback
+        # JS fallback (label 매칭)
         ctx.evaluate(
             """
             (select, label) => {
-              const opts = Array.from(select.options);
-              const hit = opts.find(o => o.text.trim() === label);
-              if (!hit) throw new Error("label not found: "+label);
+              const options = Array.from(select.options);
+              const hit = options.find(o => o.text.trim() === label);
+              if (!hit) throw new Error("label not found: " + label);
               select.value = hit.value;
               select.dispatchEvent(new Event('change', {bubbles:true}));
             }
@@ -134,18 +120,60 @@ def click_next_if_possible(ctx: Page | Frame) -> bool:
         nxt.first.click(); return True
     return False
 
-def rebind_controls(page: Page) -> tuple[Page|Frame, Locator, Locator, Locator]:
-    """검색/렌더링 후 프레임과 콤보를 다시 바인딩"""
-    ctx_form = find_target_frame(page)
-    region_cb = get_combobox_by_label(ctx_form, "지역")
-    branch_cb = get_combobox_by_label(ctx_form, "지사")
-    try:
-        type_cb = get_combobox_by_label(ctx_form, "참여유형명")
-    except Exception:
-        type_cb = get_combobox_by_label(ctx_form, "참여유형")
-    return ctx_form, region_cb, branch_cb, type_cb
+# ----------------- 시그니처(안정 재바인딩 핵심) -----------------
+class SelectSignature:
+    """select를 안정적으로 다시 찾기 위한 id/name/index 시그니처"""
+    def __init__(self, css_by_id: Optional[str], css_by_name: Optional[str], index: int):
+        self.css_by_id = css_by_id
+        self.css_by_name = css_by_name
+        self.index = index   # 같은 폼 내 select 순서(최후 폴백)
 
-# ---------- 메인 ----------
+    def query(self, ctx: Page | Frame) -> Locator:
+        if self.css_by_id:
+            loc = ctx.locator(self.css_by_id)
+            if loc.count(): return loc.first
+        if self.css_by_name:
+            loc = ctx.locator(self.css_by_name)
+            if loc.count(): return loc.first
+        # 마지막 폴백: 해당 폼 안의 select N번째
+        selects = ctx.locator("select")
+        if selects.count() > self.index:
+            return selects.nth(self.index)
+        # 정말 안되면 combobox로라도
+        cbs = ctx.get_by_role("combobox")
+        if cbs.count() > self.index:
+            return cbs.nth(self.index)
+        raise RuntimeError("select rebinding failed (id/name/index 모두 실패)")
+
+def make_signature(ctx: Page | Frame, el: Locator) -> SelectSignature:
+    # id / name 추출
+    el_id = el.get_attribute("id")
+    el_name = el.get_attribute("name")
+    css_by_id = f"select#{el_id}" if el_id else None
+    css_by_name = f"select[name='{el_name}']" if el_name else None
+    # index 추정: 같은 부모(form/fieldset) 내 select 순서
+    parent = el.locator("xpath=..")
+    selects = parent.locator("xpath=.//select")
+    index = 0
+    try:
+        total = selects.count()
+        for i in range(total):
+            if selects.nth(i).evaluate("e => e === this", arg=el.element_handle()):
+                index = i
+                break
+    except Exception:
+        # 부모 기준 실패 시 페이지 전체 기준으로
+        selects = ctx.locator("select")
+        total = selects.count()
+        for i in range(total):
+            try:
+                if selects.nth(i).evaluate("e => e === this", arg=el.element_handle()):
+                    index = i; break
+            except Exception:
+                pass
+    return SelectSignature(css_by_id, css_by_name, index)
+
+# ----------------- 메인 -----------------
 def run():
     all_rows: List[Dict] = []
 
@@ -156,28 +184,53 @@ def run():
         page.goto(URL, timeout=120_000)
         page.wait_for_load_state("domcontentloaded")
 
-        ctx_form, region_cb, branch_cb, type_cb = rebind_controls(page)
+        # 최초 프레임 및 콤보 바인딩(라벨 사용)
+        ctx_form = find_target_frame(page)
+
+        # 라벨명이 '참여유형명' 또는 '참여유형'일 수 있음 → 둘 다 시도
+        def get_type_combo(ctx) -> Locator:
+            cb = ctx.get_by_role("combobox", name="참여유형명")
+            if cb.count(): return cb.first
+            cb = ctx.get_by_role("combobox", name="참여유형")
+            if cb.count(): return cb.first
+            # 라벨 실패 시 첫 3개 select 중 세 번째가 유형일 가능성 높음(지역,지사 다음)
+            return ctx.locator("select").nth(2)
+
+        region_cb = ctx_form.get_by_role("combobox", name="지역").first \
+                    if ctx_form.get_by_role("combobox", name="지역").count() else ctx_form.locator("select").nth(0)
+        branch_cb = ctx_form.get_by_role("combobox", name="지사").first \
+                    if ctx_form.get_by_role("combobox", name="지사").count() else ctx_form.locator("select").nth(1)
+        type_cb = get_type_combo(ctx_form)
+
+        # 시그니처 기록(이게 핵심!)
+        sig_region = make_signature(ctx_form, region_cb)
+        sig_branch = make_signature(ctx_form, branch_cb)
+        sig_type   = make_signature(ctx_form, type_cb)
 
         # 지역 옵션 확인
         wait_options_loaded(region_cb, 2, 10000)
         regions_on_site = [x for x in list_options_text(region_cb) if x != "선택"]
         print("[옵션목록] 지역:", regions_on_site)
 
+        # 지역 루프
         for region in REGIONS:
             if region not in regions_on_site:
-                print(f"[스킵] 지역 '{region}' 옵션 없음")
-                continue
+                print(f"[스킵] 지역 '{region}' 옵션 없음"); continue
 
-            # 매 회차 재바인딩(안정성)
-            ctx_form, region_cb, branch_cb, type_cb = rebind_controls(page)
+            # 재바인딩(라벨 대신 시그니처)
+            ctx_form = find_target_frame(page)
+            region_cb = sig_region.query(ctx_form)
+            branch_cb = sig_branch.query(ctx_form)
+            type_cb   = sig_type.query(ctx_form)
 
             # 지역 선택
             select_by_label_with_fallback(ctx_form, region_cb, region)
             time.sleep(0.4)
 
-            # 지사/유형 옵션 새로 읽기
+            # 지사/유형 옵션 로드
             wait_options_loaded(branch_cb, 2, 10000)
             branch_opts = [x for x in list_options_text(branch_cb) if x != "선택"]
+
             wait_options_loaded(type_cb, 2, 10000)
             type_opts = [x for x in list_options_text(type_cb) if x != "선택"]
 
@@ -186,22 +239,21 @@ def run():
 
             for branch in branch_opts:
                 for typ in type_opts:
-                    # 매 조합마다 재바인딩 (지사/유형 선택 전에)
-                    ctx_form, region_cb, branch_cb, type_cb = rebind_controls(page)
+                    # 매 조합마다 재바인딩(시그니처 기반)
+                    ctx_form = find_target_frame(page)
+                    region_cb = sig_region.query(ctx_form)
+                    branch_cb = sig_branch.query(ctx_form)
+                    type_cb   = sig_type.query(ctx_form)
 
-                    # 지역 다시 설정(조합 반복 중 DOM이 바뀌었을 수 있음)
-                    try:
-                        select_by_label_with_fallback(ctx_form, region_cb, region)
-                    except Exception:
-                        # 프레임 체인지 대비 한번 더
-                        ctx_form, region_cb, branch_cb, type_cb = rebind_controls(page)
-                        select_by_label_with_fallback(ctx_form, region_cb, region)
+                    # 지역 다시 지정(의존성 유지)
+                    select_by_label_with_fallback(ctx_form, region_cb, region)
                     time.sleep(0.2)
 
                     # 지사/유형 선택
                     wait_options_loaded(branch_cb, 2, 10000)
                     select_by_label_with_fallback(ctx_form, branch_cb, branch)
                     time.sleep(0.2)
+
                     wait_options_loaded(type_cb, 2, 10000)
                     try:
                         select_by_label_with_fallback(ctx_form, type_cb, typ)
@@ -212,7 +264,7 @@ def run():
                     click_search_or_query(ctx_form)
                     page.wait_for_load_state("networkidle"); time.sleep(0.6)
 
-                    # 결과 테이블
+                    # 결과 수집
                     table = locate_result_table(ctx_form)
                     rows = extract_rows_from_table(table)
                     for r in rows:
