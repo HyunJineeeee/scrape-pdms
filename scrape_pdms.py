@@ -39,7 +39,20 @@ def run():
 
         for target in TARGETS:
             # 1) 지역 선택
-            page.locator("select:has-text('지역')").select_option(label=target["region"])
+            region_cb = page.get_by_role("combobox", name="지역")
+            branch_cb = page.get_by_role("combobox", name="지사")
+            type_cb   = page.get_by_role("combobox", name="참여유형")
+
+            region_cb.wait_for(timeout=15000)
+            region_cb.select_option(label=target["region"])
+            page.wait_for_timeout(500)
+
+            branch_cb.select_option(label=target["branch"])
+            page.wait_for_timeout(500)
+
+            type_cb.select_option(label=target["type"])
+            page.get_by_role("button", name="검색").click()
+            page.wait_for_load_state("networkidle")
             time.sleep(0.5)
 
             # 2) 지사 선택
