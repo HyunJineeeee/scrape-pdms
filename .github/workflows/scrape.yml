@@ -3,11 +3,12 @@ name: Scrape PDMS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 21 * * 1"   # 매주 화요일 오전 6시(KST) = 21:00 UTC 월요일
+    - cron: "0 21 * * 1"   # 매주 화 06:00 KST (월 21:00 UTC)
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -15,17 +16,38 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"                # 🔥 pip 캐시 활성화
 
-      - name: Install deps
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright  # 🔥 브라우저 캐시 (설치시간 대폭 단축)
+          key: ${{ runner.os }}-ms-playwright-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ms-playwright-
+
+      - name: Install deps (fast)
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Scrape
-        run: python scrape_pdms.py
+      - name: Run scraper
+        run: |
+          python scrape_pdms.py
 
       - name: Upload CSV artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: pdms-learning-companies
           path: pdms_learning_companies.csv
+
+      - name: Upload debug artifacts if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            *.png
+            *.log
