@@ -1,0 +1,31 @@
+name: Scrape PDMS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 21 * * 1"   # 매주 화요일 오전 6시(KST) = 21:00 UTC 월요일
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Scrape
+        run: python scrape_pdms.py
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdms-learning-companies
+          path: pdms_learning_companies.csv
